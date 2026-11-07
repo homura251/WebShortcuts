@@ -5,16 +5,30 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: 'Optional existing tag to publish, e.g. v1.3.0'
+        required: false
+        type: string
+      inspect_run_id:
+        description: 'Optional CI run whose device test failure details should be printed'
+        required: false
+        type: string
+      build_run_id:
+        description: 'Successful Android CI run for that exact tag commit'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  group: android-${{ inputs.publish_tag && format('release-{0}', inputs.publish_tag) || inputs.inspect_run_id && format('inspect-{0}', inputs.inspect_run_id) || format('ci-{0}', github.head_ref || github.ref_name) }}
+  cancel-in-progress: ${{ !inputs.publish_tag }}
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || (inputs.publish_tag == '' && inputs.inspect_run_id == '')
     name: Build, test and lint
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -33,6 +47,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Verify release publication guards
+        run: python3 -m unittest discover -s .github/scripts/tests -v
       - name: Build debug, verify tests and lint, and shrink release
         run: ./gradlew --no-daemon --continue --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleRelease
       - name: Verify minimal APK permissions
@@ -62,6 +78,7 @@ jobs:
           retention-days: 30
 
   device-tests:
+    if: github.event_name != 'workflow_dispatch' || (inputs.publish_tag == '' && inputs.inspect_run_id == '')
     name: Android 35 device tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -119,3 +136,96 @@ jobs:
             app/build/reports/androidTests/
             app/build/outputs/androidTest-results/
           retention-days: 30
+
+  publish-release:
+    name: Publish verified APKs to release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.publish_tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      INSPECT_RUN_ID: ${{ inputs.inspect_run_id }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify release publication guards
+        run: python3 -m unittest discover -s .github/scripts/tests -v
+      - name: Verify completed build and exact tag commit
+        run: python3 .github/scripts/publish-release.py validate
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          pattern: WebShortcuts-*
+          path: downloaded-apks
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          name: verification-reports
+          path: downloaded-reports/jvm
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          name: device-test-reports
+          path: downloaded-reports/device
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
+      - name: Package APKs, checksums and provenance
+        run: python3 .github/scripts/publish-release.py package
+      - name: Upload, download-verify and publish release
+        run: python3 .github/scripts/publish-release.py publish
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-publication
+          path: |
+            release-validation.json
+            RELEASE-NOTES.md
+            release-assets/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  inspect-device-tests:
+    name: Inspect device test reports
+    if: github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' && inputs.publish_tag == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.inspect_run_id }}
+          name: device-test-reports
+          path: device-reports
+      - name: Print test failures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          files = list(Path('device-reports').rglob('TEST-*.xml'))
+          assert files, 'No JUnit device reports were found'
+          for path in files:
+              root = ET.parse(path).getroot()
+              print(path, root.attrib)
+              for test in root.iter('testcase'):
+                  for kind in ('failure', 'error'):
+                      for failure in test.findall(kind):
+                          print(test.get('classname'), test.get('name'), failure.get('message'))
+                          print(failure.text)
+          PY
