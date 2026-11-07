@@ -1,6 +1,7 @@
 package io.github.homura251.webshortcuts.transfer
 
 import io.github.homura251.webshortcuts.data.BookmarkItem
+import io.github.homura251.webshortcuts.data.BookmarkTag
 import io.github.homura251.webshortcuts.ui.theme.AppearancePreferences
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
@@ -48,8 +49,13 @@ data class ImportPreview(
     val hasAppearance: Boolean,
     val exportedAt: Long? = null,
     val warnings: List<String> = emptyList(),
+    val tagCount: Int = 0,
+    val newTagCount: Int = 0,
+    val tagUpdatedCount: Int = 0,
+    val localTagCount: Int = 0,
+    val mergedTagCount: Int = 0,
 ) {
-    val canMerge get() = localCount + newCount <= 2000 && (format == TransferFormat.BACKUP_ZIP || itemCount > 0 || duplicateCount > 0)
+    val canMerge get() = localCount + newCount <= 2000 && mergedTagCount <= 2000 && (format == TransferFormat.BACKUP_ZIP || itemCount > 0 || duplicateCount > 0)
     val canReplace get() = format == TransferFormat.BACKUP_ZIP || itemCount > 0
 }
 
@@ -67,6 +73,8 @@ data class ImportResult(
     val skippedInvalid: Int,
     val replaced: Boolean,
     val warnings: List<String> = emptyList(),
+    val addedTags: Int = 0,
+    val tagUpdatedBookmarks: Int = 0,
 )
 
 internal data class ParsedImport(
@@ -76,6 +84,7 @@ internal data class ParsedImport(
     val duplicateCount: Int = 0,
     val exportedAt: Long? = null,
     val warnings: List<String> = emptyList(),
+    val tags: List<BookmarkTag> = emptyList(),
 )
 
 internal data class PreparedImport(

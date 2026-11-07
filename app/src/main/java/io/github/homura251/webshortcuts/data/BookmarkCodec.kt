@@ -7,13 +7,17 @@ import io.github.homura251.webshortcuts.icons.CropRect
 
 /** Pure serialization, kept separate from Android I/O for deterministic migration tests. */
 object BookmarkCodec {
-    const val SCHEMA_VERSION = 3
+    const val SCHEMA_VERSION = 4
     const val MAX_BOOKMARKS = 2000
     const val MAX_JSON_BYTES = 4 * 1024 * 1024
     private val iconPath = Regex("icons/(auto|custom)/[a-zA-Z0-9._-]+\\.(webp|png)")
     private val originalPath = Regex("icons/original/[a-zA-Z0-9_-]{1,100}\\.png")
 
-    fun encode(items: List<BookmarkItem>): String {
+    fun encode(items: List<BookmarkItem>): String = encode(LibrarySnapshot(items))
+
+    fun encode(library: LibrarySnapshot): String {
+        val items = library.bookmarks
+        validate(library)
         require(items.size <= MAX_BOOKMARKS) { "收藏数量已达到上限（$MAX_BOOKMARKS）" }
         require(items.map { it.id }.toSet().size == items.size) { "收藏 ID 重复" }
         val records = JSONArray()
@@ -37,23 +41,37 @@ object BookmarkCodec {
                 put("iconDescription", item.iconDescription ?: JSONObject.NULL)
                 put("createdAt", item.createdAt)
                 put("updatedAt", item.updatedAt)
+                put("tagIds", JSONArray(item.tagIds.sorted()))
             })
         }
-        return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("bookmarks", records).toString()
+        val tags = JSONArray()
+        library.tags.forEach { tags.put(JSONObject().put("id", it.id).put("name", it.name)) }
+        return JSONObject().put("schemaVersion", SCHEMA_VERSION).put("bookmarks", records).put("tags", tags).toString()
     }
 
-    fun decode(json: String): List<BookmarkItem> {
+    fun decode(json: String): List<BookmarkItem> = decodeLibrary(json).bookmarks
+
+    fun decodeLibrary(json: String): LibrarySnapshot {
         val trimmed = json.trim()
         require(trimmed.isNotEmpty()) { "收藏数据为空或已损坏" }
+        var version = 1
+        var tags = emptyList<BookmarkTag>()
         val records = if (trimmed.startsWith('[')) JSONArray(trimmed) else {
             val root = JSONObject(trimmed)
-            val version = root.optInt("schemaVersion", 1)
+            version = root.optInt("schemaVersion", 1)
             require(version in 1..SCHEMA_VERSION) { "收藏来自较新版本，请先更新应用" }
+            if (version >= 4) {
+                val catalog = root.getJSONArray("tags")
+                require(catalog.length() <= LibraryTags.MAX_TAGS) { "标签数量超过支持的上限" }
+                tags = (0 until catalog.length()).map { i -> catalog.getJSONObject(i).let {
+                    BookmarkTag(it.getString("id"), it.getString("name"))
+                } }
+            }
             root.getJSONArray("bookmarks")
         }
         require(records.length() <= MAX_BOOKMARKS) { "收藏数量超过支持的上限" }
         val seen = mutableSetOf<String>()
-        return (0 until records.length()).map { index ->
+        val items = (0 until records.length()).map { index ->
             val record = records.getJSONObject(index)
             val url = UrlNormalizer.normalize(record.getString("url"))
             val id = record.nullableString("id") ?: record.nullableString("uuid")
@@ -83,8 +101,27 @@ object BookmarkCodec {
                 iconDescription = record.nullableString("iconDescription")?.take(256),
                 createdAt = record.optLong("createdAt", 0).coerceAtLeast(0),
                 updatedAt = record.optLong("updatedAt", record.optLong("createdAt", 0)).coerceAtLeast(0),
+                tagIds = if (version < 4) emptySet() else record.getJSONArray("tagIds").let { ids ->
+                    require(ids.length() <= LibraryTags.MAX_TAGS) { "收藏标签数量超过上限" }
+                    val values = (0 until ids.length()).map(ids::getString)
+                    require(values.toSet().size == values.size) { "收藏标签重复" }
+                    values.toSet()
+                },
             ).also(::validate)
         }
+        return LibrarySnapshot(items, tags).also(::validate)
+    }
+
+    fun validate(library: LibrarySnapshot) {
+        require(library.tags.size <= LibraryTags.MAX_TAGS) { "标签数量超过支持的上限" }
+        require(library.tags.map { it.id }.toSet().size == library.tags.size) { "标签 ID 重复" }
+        require(library.tags.map { LibraryTags.key(it.name) }.toSet().size == library.tags.size) { "标签名称重复" }
+        library.tags.forEach {
+            require(it.id.isNotBlank() && it.id.length <= 128 && it.id.none(Char::isISOControl)) { "标签 ID 无效" }
+            require(LibraryTags.name(it.name) == it.name) { "标签名称包含首尾空白" }
+        }
+        val ids = library.tags.map { it.id }.toSet()
+        require(library.bookmarks.all { ids.containsAll(it.tagIds) }) { "收藏引用了不存在的标签" }
     }
 
     fun validate(item: BookmarkItem) {

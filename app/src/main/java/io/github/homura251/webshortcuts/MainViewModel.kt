@@ -9,6 +9,11 @@ import androidx.lifecycle.viewModelScope
 import io.github.homura251.webshortcuts.data.BookmarkItem
 import io.github.homura251.webshortcuts.data.IconSourceMode
 import io.github.homura251.webshortcuts.data.UrlNormalizer
+import io.github.homura251.webshortcuts.data.LibraryTags
+import io.github.homura251.webshortcuts.data.TagChanges
+import io.github.homura251.webshortcuts.data.TagFilter
+import io.github.homura251.webshortcuts.ui.TagEditorUiState
+import io.github.homura251.webshortcuts.ui.TagEditMode
 import io.github.homura251.webshortcuts.icons.IconFetchResult
 import io.github.homura251.webshortcuts.icons.CropRect
 import io.github.homura251.webshortcuts.ui.EditorUiState
@@ -56,13 +61,24 @@ class MainViewModel(application: Application, private val savedState: SavedState
     private var importEpoch = 0
     private var previewEpoch = 0
     private val refreshingIds = mutableSetOf<String>()
+    private var libraryUiRestored = false
 
     init {
         viewModelScope.launch {
             container.transferGate.busy.collect { busy -> mutableState.update { it.copy(transferBusy = busy) } }
         }
         viewModelScope.launch {
-            repository.bookmarks.collect { items -> mutableState.update { it.copy(bookmarks = items) } }
+            repository.library.collect { library ->
+                mutableState.update { home ->
+                    val known = library.tags.map { it.id }.toSet()
+                    home.copy(bookmarks = library.bookmarks, tags = library.tags,
+                        tagFilter = if (libraryUiRestored) home.tagFilter.prune(library.tags) else home.tagFilter,
+                        selectedIds = home.selectedIds.intersect(library.bookmarks.map { it.id }.toSet()),
+                        editor = home.editor?.let { it.copy(tagIds = it.tagIds.intersect(known)) },
+                        tagEditor = home.tagEditor?.let { sheet -> sheet.copy(selectedIds = sheet.selectedIds.intersect(known)) })
+                }
+                if (libraryUiRestored) persistLibraryUi()
+            }
         }
         viewModelScope.launch {
             repository.loadError.collect { error -> mutableState.update { it.copy(error = error) } }
@@ -71,7 +87,9 @@ class MainViewModel(application: Application, private val savedState: SavedState
             try {
                 repository.load()
                 if (repository.loadError.value == null) {
+                    restoreLibraryUi()
                     restoreEditor()
+                    restoreTagEditor()
                     container.mutationMutex.withLock { cleanUnusedIcons() }
                 }
                 drafts.prune(listOfNotNull(customDraftName, originalDraftName).toSet())
@@ -83,11 +101,200 @@ class MainViewModel(application: Application, private val savedState: SavedState
         }
     }
 
-    fun setQuery(value: String) { mutableState.update { it.copy(query = value) } }
+    fun setQuery(value: String) {
+        if (mutableState.value.selectionMode) return
+        savedState["home.query"] = value
+        mutableState.update { it.copy(query = value) }
+    }
+
+    fun setTagFilter(filter: TagFilter) {
+        if (mutableState.value.selectionMode) return
+        val next = filter.prune(repository.library.value.tags)
+        savedState["home.tagIds"] = ArrayList(next.ids)
+        savedState["home.untagged"] = next.untagged
+        mutableState.update { it.copy(tagFilter = next) }
+    }
+
+    fun toggleTagFilter(id: String) = setTagFilter(mutableState.value.tagFilter.toggle(id))
+
+    fun select(item: BookmarkItem) {
+        if (transferBlocked() || mutableState.value.tagSaving) return
+        val home = mutableState.value
+        if (home.loading || home.error != null) return
+        val selected = if (item.id in home.selectedIds) home.selectedIds - item.id else home.selectedIds + item.id
+        savedState["home.selecting"] = true
+        savedState["home.selected"] = ArrayList(selected)
+        mutableState.update { it.copy(selectionMode = true, selectedIds = selected) }
+    }
+
+    fun selectAll() {
+        val home = mutableState.value
+        if (!home.selectionMode || home.tagSaving) return
+        val ids = LibraryTags.filter(home.bookmarks, home.tags, home.query, home.tagFilter).map { it.id }.toSet()
+        savedState["home.selected"] = ArrayList(ids)
+        mutableState.update { it.copy(selectedIds = ids) }
+    }
+
+    fun cancelSelection() {
+        if (mutableState.value.tagSaving) return
+        savedState["home.selecting"] = false
+        savedState["home.selected"] = arrayListOf<String>()
+        mutableState.update { it.copy(selectionMode = false, selectedIds = emptySet()) }
+    }
+
+    fun editTags(item: BookmarkItem) {
+        if (transferBlocked()) return
+        val latest = repository.library.value.bookmarks.firstOrNull { it.id == item.id } ?: return
+        publishTagEditor(TagEditorUiState(setOf(item.id), initialIds = latest.tagIds, selectedIds = latest.tagIds))
+    }
+
+    fun editEditorTags() {
+        val editor = mutableState.value.editor ?: return
+        if (editor.saving || transferBlocked()) return
+        publishTagEditor(TagEditorUiState(setOf(editor.id), initialIds = editor.tagIds,
+            selectedIds = editor.tagIds, newNames = editor.newTagNames, forEditor = true))
+    }
+
+    fun editBatchTags(remove: Boolean) {
+        val home = mutableState.value
+        if (home.selectedIds.isEmpty() || home.tagSaving || transferBlocked()) return
+        publishTagEditor(TagEditorUiState(home.selectedIds, if (remove) TagEditMode.REMOVE else TagEditMode.ADD))
+    }
+
+    fun toggleEditorTag(id: String) {
+        val sheet = mutableState.value.tagEditor ?: return
+        if (sheet.saving) return
+        publishTagEditor(sheet.copy(selectedIds = if (id in sheet.selectedIds) sheet.selectedIds - id else sheet.selectedIds + id, error = null))
+    }
+
+    fun toggleNewTag(name: String) {
+        val sheet = mutableState.value.tagEditor ?: return
+        if (sheet.saving) return
+        publishTagEditor(sheet.copy(newNames = sheet.newNames.filterNot { it == name }))
+    }
+
+    fun addDraftTag(raw: String) {
+        val sheet = mutableState.value.tagEditor ?: return
+        if (sheet.saving || sheet.mode == TagEditMode.REMOVE) return
+        try {
+            val name = LibraryTags.name(raw)
+            val existing = repository.library.value.tags.firstOrNull { LibraryTags.key(it.name) == LibraryTags.key(name) }
+            val pending = (sheet.newNames + name).distinctBy(LibraryTags::key)
+            val unresolved = pending.count { value -> repository.library.value.tags.none { LibraryTags.key(it.name) == LibraryTags.key(value) } }
+            if (existing == null) require(repository.library.value.tags.size + unresolved <= LibraryTags.MAX_TAGS) { "标签数量已达到上限（2000）" }
+            val next = if (existing != null) sheet.copy(selectedIds = sheet.selectedIds + existing.id, error = null)
+                else sheet.copy(newNames = pending, error = null)
+            publishTagEditor(next)
+        } catch (error: IllegalArgumentException) { publishTagEditor(sheet.copy(error = error.message)) }
+    }
+
+    fun dismissTagEditor() {
+        if (mutableState.value.tagEditor?.saving == true) return
+        publishTagEditor(null)
+    }
+
+    fun applyTagEditor() {
+        val epoch = container.transferGate.epoch
+        val sheet = mutableState.value.tagEditor ?: return
+        if (sheet.saving || transferBlocked()) return
+        if (sheet.forEditor) {
+            changeEditor { it.copy(tagIds = sheet.selectedIds, newTagNames = sheet.newNames, dirty = true) }
+            publishTagEditor(null)
+            return
+        }
+        val changes = when (sheet.mode) {
+            TagEditMode.SET -> TagChanges(sheet.selectedIds - sheet.initialIds, sheet.initialIds - sheet.selectedIds, sheet.newNames)
+            TagEditMode.ADD -> TagChanges(addIds = sheet.selectedIds, newNames = sheet.newNames)
+            TagEditMode.REMOVE -> TagChanges(removeIds = sheet.selectedIds)
+        }
+        publishTagEditor(sheet.copy(saving = true, error = null))
+        mutableState.update { it.copy(tagSaving = true) }
+        viewModelScope.launch {
+            try {
+                val count = container.mutationMutex.withLock {
+                    container.transferGate.requireWritable(epoch)
+                    repository.applyTags(sheet.targetIds, changes)
+                }
+                publishTagEditor(null)
+                mutableState.update { it.copy(tagSaving = false) }
+                cancelSelection()
+                notify("已更新 $count 条收藏的标签")
+            } catch (error: Exception) {
+                rethrowCancellation(error)
+                publishTagEditor(sheet.copy(error = "标签未保存。${error.message.orEmpty().take(120)}"))
+                mutableState.update { it.copy(tagSaving = false) }
+            }
+        }
+    }
+
+    fun createTag(name: String) = mutateCatalog { repository.createTag(name); Unit }
+    fun renameTag(id: String, name: String) = mutateCatalog { repository.renameTag(id, name) }
+    fun deleteTag(id: String) = mutateCatalog { repository.deleteTag(id) }
+
+    private fun mutateCatalog(block: suspend () -> Unit) {
+        val epoch = container.transferGate.epoch
+        if (transferBlocked() || mutableState.value.tagSaving) return
+        mutableState.update { it.copy(tagSaving = true, tagError = null) }
+        viewModelScope.launch {
+            try {
+                container.mutationMutex.withLock { container.transferGate.requireWritable(epoch); block() }
+                notify("标签已保存")
+            } catch (error: Exception) { rethrowCancellation(error); mutableState.update { it.copy(tagError = error.message ?: "标签保存失败，请重试") } }
+            finally { mutableState.update { it.copy(tagSaving = false) } }
+        }
+    }
+
+    private fun persistLibraryUi() {
+        val home = mutableState.value
+        savedState["home.query"] = home.query
+        savedState["home.tagIds"] = ArrayList(home.tagFilter.ids)
+        savedState["home.untagged"] = home.tagFilter.untagged
+        savedState["home.selecting"] = home.selectionMode
+        savedState["home.selected"] = ArrayList(home.selectedIds)
+    }
+
+    private fun restoreLibraryUi() {
+        val library = repository.library.value
+        val filter = TagFilter(savedState.get<ArrayList<String>>("home.tagIds").orEmpty().toSet(),
+            savedState["home.untagged"] ?: false).prune(library.tags)
+        val selected = savedState.get<ArrayList<String>>("home.selected").orEmpty().intersect(library.bookmarks.map { it.id }.toSet())
+        mutableState.update { it.copy(bookmarks = library.bookmarks, tags = library.tags,
+            query = savedState["home.query"] ?: "", tagFilter = filter,
+            selectionMode = savedState["home.selecting"] ?: false, selectedIds = selected) }
+        libraryUiRestored = true
+        persistLibraryUi()
+    }
+
+    private fun publishTagEditor(sheet: TagEditorUiState?) {
+        TAG_SHEET_KEYS.forEach { savedState.remove<Any?>(it) }
+        if (sheet != null) {
+            savedState["tags.targets"] = ArrayList(sheet.targetIds)
+            savedState["tags.mode"] = sheet.mode.name
+            savedState["tags.initial"] = ArrayList(sheet.initialIds)
+            savedState["tags.selected"] = ArrayList(sheet.selectedIds)
+            savedState["tags.names"] = ArrayList(sheet.newNames)
+            savedState["tags.editor"] = sheet.forEditor
+        }
+        mutableState.update { it.copy(tagEditor = sheet) }
+    }
+
+    private fun restoreTagEditor() {
+        val targets = savedState.get<ArrayList<String>>("tags.targets")?.toSet() ?: return
+        val forEditor = savedState.get<Boolean>("tags.editor") ?: false
+        val validTargets = if (forEditor) targets.intersect(setOfNotNull(mutableState.value.editor?.id))
+            else targets.intersect(repository.library.value.bookmarks.map { it.id }.toSet())
+        if (validTargets.isEmpty()) { publishTagEditor(null); return }
+        val known = repository.library.value.tags.map { it.id }.toSet()
+        publishTagEditor(TagEditorUiState(validTargets,
+            mode = runCatching { TagEditMode.valueOf(savedState["tags.mode"] ?: "SET") }.getOrDefault(TagEditMode.SET),
+            initialIds = savedState.get<ArrayList<String>>("tags.initial").orEmpty().intersect(known),
+            selectedIds = savedState.get<ArrayList<String>>("tags.selected").orEmpty().intersect(known),
+            newNames = savedState.get<ArrayList<String>>("tags.names").orEmpty(), forEditor = forEditor))
+    }
 
     fun add(url: String = "", title: String = "") {
         if (transferBlocked()) return
-        if (mutableState.value.loading) return
+        if (mutableState.value.loading || mutableState.value.selectionMode) return
         if (mutableState.value.error != null) {
             notify("本地数据尚未成功读取，请重新打开应用后重试")
             return
@@ -96,7 +303,7 @@ class MainViewModel(application: Application, private val savedState: SavedState
             notify("请先保存或关闭正在编辑的收藏")
             return
         }
-        beginEditor(null, EditorUiState(id = UUID.randomUUID().toString(), isNew = true, title = title, url = url, dirty = url.isNotBlank()))
+        beginEditor(null, EditorUiState(id = UUID.randomUUID().toString(), isNew = true, title = title, url = url, dirty = url.isNotBlank(), tagIds = mutableState.value.tagFilter.ids))
         if (url.isNotBlank()) onUrlFocusLost()
     }
 
@@ -106,6 +313,7 @@ class MainViewModel(application: Application, private val savedState: SavedState
             id = item.id, isNew = false, title = item.title, url = item.url,
             mode = item.selectedIconSource, sourceLabel = item.iconDescription,
             hasCustomImage = item.customImagePath != null, cropRect = item.customCrop,
+            tagIds = item.tagIds, initialTagIds = item.tagIds,
         ))
     }
 
@@ -121,8 +329,8 @@ class MainViewModel(application: Application, private val savedState: SavedState
         customDraftName = null
         originalDraftName = null
         lastAttemptedUrl = null
+        persistEditor(editor)
         mutableState.update { it.copy(editor = editor) }
-        persistEditor()
         updatePreview()
         if (loadCropSource && item?.customOriginalPath != null) {
             val epoch = editorEpoch
@@ -152,6 +360,7 @@ class MainViewModel(application: Application, private val savedState: SavedState
         customDraftName = null
         originalDraftName = null
         DRAFT_KEYS.forEach { savedState.remove<Any?>(it) }
+        if (mutableState.value.tagEditor?.forEditor == true) publishTagEditor(null)
         // A closed editor must already have no restorable draft when subscribers observe it.
         mutableState.update { it.copy(editor = null) }
         viewModelScope.launch { drafts.delete(discarded); drafts.delete(discardedOriginal) }
@@ -345,6 +554,10 @@ class MainViewModel(application: Application, private val savedState: SavedState
         val pendingAuto = autoImage.takeIf { autoImageUrl == url }
         val pendingCustom = customImage
         val pendingOriginal = customOriginal.takeIf { customOriginalDirty }
+        val changes = TagChanges(editor.tagIds - editor.initialTagIds, editor.initialTagIds - editor.tagIds, editor.newTagNames)
+        val tagsOnly = !editor.isNew && original?.let {
+            it.title == title && it.url == url && it.selectedIconSource == editor.mode
+        } == true && pendingAuto == null && pendingCustom == null && pendingOriginal == null
         viewModelScope.launch {
             var saved = false
             var wasPinned = false
@@ -356,6 +569,12 @@ class MainViewModel(application: Application, private val savedState: SavedState
                     val latest = repository.find(editor.id)
                     check(editor.isNew || latest != null) { "此收藏已被删除" }
                     val previous = latest ?: original
+                    if (tagsOnly) {
+                        repository.applyTags(setOf(editor.id), changes)
+                        saved = true
+                        synced = true
+                        return@withLock
+                    }
                     val version = (previous?.imageVersion ?: 0) + 1
                     val sameUrl = previous?.url == url
                     var autoPath = previous?.autoImagePath.takeIf { sameUrl }
@@ -375,8 +594,9 @@ class MainViewModel(application: Application, private val savedState: SavedState
                         lastFetchedAt = if (pendingAuto != null) autoImageFetchedAt ?: now else previous?.lastFetchedAt.takeIf { sameUrl },
                         iconDescription = pendingAuto?.description ?: previous?.iconDescription.takeIf { sameUrl },
                         createdAt = previous?.createdAt ?: now, updatedAt = now,
+                        tagIds = previous?.tagIds.orEmpty(),
                     )
-                    repository.save(item)
+                    repository.save(item, changes)
                     saved = true
                     if (continueAutomaticFetch && item.autoImagePath == null) backgroundFetch = item
                     wasPinned = container.shortcutPublisher.isPinned(item.id)
@@ -386,12 +606,13 @@ class MainViewModel(application: Application, private val savedState: SavedState
             } catch (error: Exception) {
                 rethrowCancellation(error)
                 if (!saved) {
-                    changeEditor { it.copy(saving = false, error = "保存失败，原有收藏未被覆盖。请检查设备剩余空间后重试。") }
+                    changeEditor { it.copy(saving = false, error = "保存失败，原有收藏未被覆盖。${error.message.orEmpty().take(120)}") }
                     return@launch
                 }
             }
             closeEditor()
             notify(when {
+                tagsOnly -> "标签已保存"
                 backgroundFetch != null -> "已保存，正在继续获取网站图标"
                 !synced -> "已保存；桌面更新暂未完成，可在收藏菜单中重试"
                 wasPinned -> "已保存并请求更新桌面快捷方式"
@@ -626,6 +847,9 @@ class MainViewModel(application: Application, private val savedState: SavedState
         savedState["draft.dirty"] = editor.dirty
         savedState["draft.custom"] = customDraftName
         savedState["draft.original"] = originalDraftName
+        savedState["draft.tags"] = ArrayList(editor.tagIds)
+        savedState["draft.initialTags"] = ArrayList(editor.initialTagIds)
+        savedState["draft.newTags"] = ArrayList(editor.newTagNames)
         savedState["draft.crop"] = editor.cropRect?.let { floatArrayOf(it.left, it.top, it.right, it.bottom) }
     }
 
@@ -643,8 +867,13 @@ class MainViewModel(application: Application, private val savedState: SavedState
         val crop = if (savedState.contains("draft.crop")) savedState.get<FloatArray>("draft.crop")?.let { values ->
             runCatching { require(values.size == 4); CropRect(values[0], values[1], values[2], values[3]) }.getOrNull()
         } else previous?.customCrop
+        val knownTags = repository.library.value.tags.map { it.id }.toSet()
+        val tagIds = if (savedState.contains("draft.tags")) savedState.get<ArrayList<String>>("draft.tags").orEmpty().intersect(knownTags) else previous?.tagIds.orEmpty()
+        val initialTags = if (savedState.contains("draft.initialTags")) savedState.get<ArrayList<String>>("draft.initialTags").orEmpty().intersect(knownTags) else previous?.tagIds.orEmpty()
+        val newTags = savedState.get<ArrayList<String>>("draft.newTags").orEmpty().toList()
         beginEditor(previous, EditorUiState(id = id, isNew = isNew, title = title, url = url, mode = mode, dirty = dirty,
-            hasCustomImage = previous?.customImagePath != null, cropRect = crop), loadCropSource = false)
+            hasCustomImage = previous?.customImagePath != null, cropRect = crop,
+            tagIds = tagIds, initialTagIds = initialTags, newTagNames = newTags), loadCropSource = false)
         customImage = drafts.read(customName)
         customDraftName = customName.takeIf { customImage != null }
         val restoredSource = drafts.read(sourceName)
@@ -700,6 +929,7 @@ class MainViewModel(application: Application, private val savedState: SavedState
         SKIPPED("收藏已修改或正在刷新，本次未覆盖"),
     }
     private companion object {
-        val DRAFT_KEYS = listOf("draft.id", "draft.new", "draft.title", "draft.url", "draft.mode", "draft.dirty", "draft.custom", "draft.original", "draft.crop")
+        val DRAFT_KEYS = listOf("draft.id", "draft.new", "draft.title", "draft.url", "draft.mode", "draft.dirty", "draft.custom", "draft.original", "draft.crop", "draft.tags", "draft.initialTags", "draft.newTags")
+        val TAG_SHEET_KEYS = listOf("tags.targets", "tags.mode", "tags.initial", "tags.selected", "tags.names", "tags.editor")
     }
 }

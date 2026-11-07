@@ -3,6 +3,7 @@ package io.github.homura251.webshortcuts.ui
 import android.graphics.Bitmap
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,6 +42,8 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.ImportExport
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.automirrored.filled.Label
+import androidx.compose.material3.Checkbox
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Palette
@@ -104,6 +107,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
@@ -119,6 +123,7 @@ import androidx.core.view.WindowCompat
 import io.github.homura251.webshortcuts.R
 import io.github.homura251.webshortcuts.data.BookmarkItem
 import io.github.homura251.webshortcuts.data.IconSourceMode
+import io.github.homura251.webshortcuts.data.BookmarkTag
 import io.github.homura251.webshortcuts.icons.CropRect
 import io.github.homura251.webshortcuts.icons.IconPolicy
 import io.github.homura251.webshortcuts.icons.IconResolver
@@ -160,10 +165,14 @@ fun WebShortcutsApp(
     appearance: AppearancePreferences = AppearancePreferences(),
     onAppearanceChange: (AppearancePreferences) -> Unit = {},
     onOpenTransfer: () -> Unit = {},
+    tagActions: TagActions = TagActions(),
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
     var showAppearance by rememberSaveable { mutableStateOf(false) }
+    var showTagFilter by rememberSaveable { mutableStateOf(false) }
+    var showTagManager by rememberSaveable { mutableStateOf(false) }
+    BackHandler(state.selectionMode && state.tagEditor == null) { tagActions.cancelSelection() }
     var deleteTarget by remember { mutableStateOf<BookmarkItem?>(null) }
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
     val autoCount = state.bookmarks.count { it.selectedIconSource == IconSourceMode.AUTO }
@@ -173,46 +182,60 @@ fun WebShortcutsApp(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.app_name), style = MaterialTheme.typography.titleLarge,
+                title = { Text(if (state.selectionMode) stringResource(R.string.selected_bookmark_count, state.selectedIds.size) else stringResource(R.string.app_name), style = MaterialTheme.typography.titleLarge,
                     maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                navigationIcon = {
+                    if (state.selectionMode) IconButton(onClick = tagActions.cancelSelection, enabled = !state.tagSaving) {
+                        Icon(Icons.Default.Close, stringResource(R.string.cancel_selection))
+                    }
+                },
                 scrollBehavior = scrollBehavior,
                 colors = TopAppBarDefaults.topAppBarColors(
                     scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
                 ),
                 actions = {
-                    IconButton(onClick = { showAppearance = true }, enabled = !state.transferBusy, modifier = Modifier.testTag("open_appearance")) {
-                        Icon(Icons.Default.Palette, contentDescription = stringResource(R.string.appearance_title))
-                    }
-                    Box {
-                        IconButton(onClick = { menuExpanded = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.more_options))
+                    if (state.selectionMode) {
+                        TextButton(onClick = tagActions.selectAll, enabled = !state.tagSaving,
+                            modifier = Modifier.testTag("select_all_bookmarks")) { Text(stringResource(R.string.select_all)) }
+                    } else {
+                        IconButton(onClick = { showAppearance = true }, enabled = !state.transferBusy, modifier = Modifier.testTag("open_appearance")) {
+                            Icon(Icons.Default.Palette, contentDescription = stringResource(R.string.appearance_title))
                         }
-                        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                            DropdownMenuItem(
-                                text = { Text(stringResource(if (state.refreshing) R.string.refreshing_all else R.string.refresh_all)) },
-                                leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
-                                enabled = autoCount > 0 && !state.refreshing && !state.transferBusy,
-                                onClick = { menuExpanded = false; onRefreshAll() },
-                            )
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.transfer_title)) },
-                                leadingIcon = { Icon(Icons.Default.ImportExport, contentDescription = null) },
-                                enabled = !state.loading && state.error == null && !state.transferBusy,
-                                onClick = { menuExpanded = false; onOpenTransfer() },
-                                modifier = Modifier.testTag("open_transfer"),
-                            )
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.about_menu)) },
-                                leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
-                                onClick = { menuExpanded = false; showAbout = true },
-                            )
+                        Box {
+                            IconButton(onClick = { menuExpanded = true }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.more_options))
+                            }
+                            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(if (state.refreshing) R.string.refreshing_all else R.string.refresh_all)) },
+                                    leadingIcon = { Icon(Icons.Default.Refresh, contentDescription = null) },
+                                    enabled = autoCount > 0 && !state.refreshing && !state.transferBusy,
+                                    onClick = { menuExpanded = false; onRefreshAll() },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.transfer_title)) },
+                                    leadingIcon = { Icon(Icons.Default.ImportExport, contentDescription = null) },
+                                    enabled = !state.loading && state.error == null && !state.transferBusy && !state.tagSaving,
+                                    onClick = { menuExpanded = false; onOpenTransfer() },
+                                    modifier = Modifier.testTag("open_transfer"),
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.manage_tags)) },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Label, null) }, enabled = !state.transferBusy && !state.tagSaving,
+                                    onClick = { menuExpanded = false; showTagManager = true }, modifier = Modifier.testTag("manage_tags"))
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.about_menu)) },
+                                    leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                                    onClick = { menuExpanded = false; showAbout = true },
+                                )
+                            }
                         }
                     }
                 },
             )
         },
         floatingActionButton = {
-            if (!state.loading && state.error == null && state.bookmarks.isNotEmpty()) {
+            if (!state.loading && state.error == null && state.bookmarks.isNotEmpty() && !state.selectionMode) {
                 ExtendedFloatingActionButton(
                     onClick = { if (!state.transferBusy) onAdd() },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
@@ -223,7 +246,7 @@ fun WebShortcutsApp(
         snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         PullToRefreshBox(isRefreshing = state.refreshing,
-            onRefresh = { if (!state.loading && state.error == null && autoCount > 0 && !state.transferBusy) onRefreshAll() },
+            onRefresh = { if (!state.loading && state.error == null && autoCount > 0 && !state.transferBusy && !state.selectionMode) onRefreshAll() },
             modifier = Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
             BookmarkCollection(
                 state = state, iconResolver = iconResolver, layoutMode = appearance.layoutMode,
@@ -232,6 +255,7 @@ fun WebShortcutsApp(
                 onOpen = onOpen, onPin = onPin, onEdit = onEdit, onRefresh = onRefresh,
                 onUpdateShortcut = onUpdateShortcut, onDelete = { deleteTarget = it },
                 onClearRefreshSummary = onClearRefreshSummary,
+                tagActions = tagActions, onShowTagFilter = { showTagFilter = true },
             )
         }
     }
@@ -252,7 +276,24 @@ fun WebShortcutsApp(
             onSave = onSave,
             onCenterCropChange = onCenterCropChange,
             onCropApply = onCropApply,
+            tags = state.tags, onEditTags = tagActions.editEditor,
         )
+    }
+    if (showTagFilter && !state.selectionMode) TagPanel(stringResource(R.string.filter_tags), { showTagFilter = false }) {
+        TagFilterContent(state, tagActions.filter)
+    }
+    if (showTagManager) TagPanel(stringResource(R.string.manage_tags), { showTagManager = false }, !state.tagSaving) {
+        TagManagerContent(state, tagActions.create, tagActions.rename, tagActions.delete)
+    }
+    state.tagEditor?.let { sheet ->
+        val title = stringResource(when (sheet.mode) {
+            TagEditMode.SET -> R.string.bookmark_tags
+            TagEditMode.ADD -> R.string.add_tags
+            TagEditMode.REMOVE -> R.string.remove_tags
+        })
+        TagPanel(title, tagActions.dismiss, !sheet.saving) {
+            TagEditorContent(state.tags, sheet, tagActions.toggle, tagActions.toggleNew, tagActions.createDraft, tagActions.apply)
+        }
     }
     deleteTarget?.let { bookmark ->
         AlertDialog(
@@ -365,8 +406,17 @@ internal fun BookmarkCard(
     onUpdateShortcut: () -> Unit,
     onDelete: () -> Unit,
     compact: Boolean = false,
+    tags: List<BookmarkTag> = emptyList(),
+    selectedTags: Set<String> = emptySet(),
+    onTagClick: (String) -> Unit = {},
+    onEditTags: () -> Unit = {},
+    onLongClick: () -> Unit = {},
+    selectionMode: Boolean = false,
+    selected: Boolean = false,
+    onSelect: () -> Unit = {},
+    interactionBlocked: Boolean = false,
 ) {
-    val bitmap by produceState<Bitmap?>(initialValue = null, key1 = bookmark, key2 = iconResolver) {
+    val bitmap by produceState<Bitmap?>(initialValue = null, key1 = bookmark.copy(tagIds = emptySet(), updatedAt = 0), key2 = iconResolver) {
         value = try {
             withContext(Dispatchers.IO) { iconResolver.resolve(bookmark) }
         } catch (cancelled: CancellationException) {
@@ -380,7 +430,8 @@ internal fun BookmarkCard(
     val container = animatedIconTint(colors.surfaceContainerLow, accent, colors.onSurface, colors.onSurfaceVariant)
     val badge = animatedIconTint(colors.secondaryContainer, accent, colors.onSecondaryContainer)
     val actions: @Composable () -> Unit = {
-        BookmarkActions(bookmark, refreshing, onOpen, onPin, onEdit, onRefresh, onUpdateShortcut, onDelete)
+        if (selectionMode) Checkbox(selected, onCheckedChange = { if (!interactionBlocked) onSelect() }, enabled = !interactionBlocked)
+        else BookmarkActions(bookmark, refreshing, onOpen, onPin, onEdit, onRefresh, onUpdateShortcut, onDelete, onEditTags, !interactionBlocked)
     }
     val information: @Composable () -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -414,11 +465,13 @@ internal fun BookmarkCard(
         }
     }
     OutlinedCard(
-        onClick = onOpen,
-        modifier = Modifier.fillMaxWidth().testTag("bookmark_card_${bookmark.id}"),
+        modifier = Modifier.fillMaxWidth().testTag("bookmark_card_${bookmark.id}")
+            .combinedClickable(enabled = !interactionBlocked, onClick = { if (selectionMode) onSelect() else onOpen() },
+                onLongClick = onLongClick, onLongClickLabel = stringResource(R.string.select_bookmark))
+            .semantics { if (selectionMode) this.selected = selected },
         shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.outlinedCardColors(containerColor = container),
-        border = BorderStroke(1.dp, colors.outlineVariant.copy(alpha = 0.5f)),
+        border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) colors.primary else colors.outlineVariant.copy(alpha = 0.5f)),
     ) {
         if (compact) {
             Column(Modifier.fillMaxWidth().heightIn(min = 160.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -437,6 +490,9 @@ internal fun BookmarkCard(
                 actions()
             }
         }
+        if (tags.isNotEmpty()) Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+            BookmarkTagRow(tags, selectedTags, { if (selectionMode) onSelect() else onTagClick(it) }, !interactionBlocked, onMoreClick = onSelect.takeIf { selectionMode })
+        }
     }
 }
 
@@ -444,10 +500,11 @@ internal fun BookmarkCard(
 private fun BookmarkActions(
     bookmark: BookmarkItem, refreshing: Boolean, onOpen: () -> Unit, onPin: () -> Unit,
     onEdit: () -> Unit, onRefresh: () -> Unit, onUpdateShortcut: () -> Unit, onDelete: () -> Unit,
+    onEditTags: () -> Unit, enabled: Boolean,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        IconButton(onClick = { expanded = true }) {
+        IconButton(onClick = { expanded = true }, enabled = enabled) {
             Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.site_options, bookmark.title))
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -455,6 +512,7 @@ private fun BookmarkActions(
             BookmarkMenuItem(R.string.pin_shortcut, Icons.Default.PushPin) { expanded = false; onPin() }
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
             BookmarkMenuItem(R.string.edit_bookmark, Icons.Default.Edit) { expanded = false; onEdit() }
+            BookmarkMenuItem(R.string.bookmark_tags, Icons.AutoMirrored.Filled.Label) { expanded = false; onEditTags() }
             if (bookmark.selectedIconSource == IconSourceMode.AUTO) {
                 BookmarkMenuItem(R.string.refresh_icon, Icons.Default.Refresh, enabled = !refreshing) { expanded = false; onRefresh() }
             }
@@ -537,6 +595,8 @@ private fun BookmarkEditor(
     onSave: () -> Unit,
     onCenterCropChange: (Boolean) -> Unit,
     onCropApply: (CropRect?) -> Unit,
+    tags: List<BookmarkTag>,
+    onEditTags: () -> Unit,
 ) {
     var askDiscard by rememberSaveable(state.id) { mutableStateOf(false) }
     var roundPreview by rememberSaveable(state.id) { mutableStateOf(false) }
@@ -698,6 +758,14 @@ private fun BookmarkEditor(
                                     shape = MaterialTheme.shapes.medium,
                                 )
                             }
+                        }
+                        TextButton(onClick = onEditTags, enabled = !state.saving,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).testTag("editor_tags")) {
+                            Icon(Icons.AutoMirrored.Filled.Label, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            val names = tags.filter { it.id in state.tagIds }.map { it.name } + state.newTagNames
+                            Text(if (names.isEmpty()) stringResource(R.string.bookmark_tags) else names.joinToString(" · "),
+                                maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
                             Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)

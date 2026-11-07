@@ -22,4 +22,5 @@ data class BookmarkItem(
     val updatedAt: Long = System.currentTimeMillis(),
     val customOriginalPath: String? = null,
     val customCrop: CropRect? = null,
+    val tagIds: Set<String> = emptySet(),
 )

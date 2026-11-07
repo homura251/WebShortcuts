@@ -20,6 +20,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.github.homura251.webshortcuts.shortcuts.ChromeTabLauncher
+import io.github.homura251.webshortcuts.ui.TagActions
 import io.github.homura251.webshortcuts.ui.WebShortcutsApp
 import io.github.homura251.webshortcuts.ui.TransferSheet
 import io.github.homura251.webshortcuts.transfer.TransferFormat
@@ -89,6 +90,14 @@ class MainActivity : ComponentActivity() {
                     onClearRefreshSummary = viewModel::clearRefreshSummary,
                     appearance = appearance,
                     onAppearanceChange = { if (!container.transferGate.busy.value) themePreferences.update(it) },
+                    tagActions = TagActions(
+                        filter = viewModel::setTagFilter, toggleFilter = viewModel::toggleTagFilter,
+                        select = viewModel::select, selectAll = viewModel::selectAll, cancelSelection = viewModel::cancelSelection,
+                        edit = viewModel::editTags, editEditor = viewModel::editEditorTags, editBatch = viewModel::editBatchTags,
+                        toggle = viewModel::toggleEditorTag, toggleNew = viewModel::toggleNewTag,
+                        createDraft = viewModel::addDraftTag, apply = viewModel::applyTagEditor, dismiss = viewModel::dismissTagEditor,
+                        create = viewModel::createTag, rename = viewModel::renameTag, delete = viewModel::deleteTag,
+                    ),
                     onOpenTransfer = { if (!transferViewModel.open()) viewModel.notify("已有导入导出操作正在进行") },
                 )
                 if (transfer.visible) TransferSheet(transfer, onDismiss = transferViewModel::close,

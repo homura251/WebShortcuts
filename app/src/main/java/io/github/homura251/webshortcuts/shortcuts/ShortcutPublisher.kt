@@ -64,7 +64,9 @@ class ShortcutPublisher(
             }
             val previous = before.associateBy { it.id }
             val pinned = ShortcutManagerCompat.getShortcuts(context, ShortcutManagerCompat.FLAG_MATCH_PINNED).map { it.id }.toSet()
-            for (item in after.filter { it.id in pinned && previous[it.id] != it }) {
+            for (item in after.filter { it.id in pinned && previous[it.id]?.let { old ->
+                old.copy(tagIds = it.tagIds, updatedAt = it.updatedAt) != it
+            } != false }) {
                 if (ShortcutManagerCompat.isRateLimitingActive(context)) return@withContext false
                 val shortcut = build(item)
                 ShortcutManagerCompat.enableShortcuts(context, listOf(shortcut))

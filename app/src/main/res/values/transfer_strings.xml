@@ -3,7 +3,7 @@
     <string name="transfer_subtitle">备份收藏与图标，或与浏览器交换书签。</string>
     <string name="transfer_choose">选择 ZIP 或 HTML 文件</string>
     <string name="transfer_export_zip">导出完整备份 ZIP</string>
-    <string name="transfer_zip_detail">收藏、图标原图、裁切参数与外观设置</string>
+    <string name="transfer_zip_detail">收藏、标签、图标原图、裁切参数与外观设置</string>
     <string name="transfer_export_html">导出浏览器书签 HTML</string>
     <string name="transfer_html_detail">仅名称和网址，支持浏览器通用书签格式</string>
     <string name="transfer_backup_note">备份文件包含网址与图片，请保存在合适的位置。导出范围为全部收藏。</string>
@@ -16,8 +16,8 @@
     <string name="transfer_merge">合并</string>
     <string name="transfer_replace">全量替换</string>
     <string name="transfer_restore_appearance">恢复备份中的外观设置</string>
-    <string name="transfer_keep_local">重复项保留本机的名称和图标。</string>
-    <string name="transfer_html_note">文件夹中的书签平铺导入。图标先使用字母回退，可随后手动刷新。</string>
+    <string name="transfer_keep_local">重复项保留本机的名称、网址和图标；ZIP 仅补充新标签。</string>
+    <string name="transfer_html_note">文件夹中的书签平铺导入，不含标签。图标先使用字母回退，可随后手动刷新。</string>
     <string name="transfer_empty_html">没有可导入的 HTTP(S) 网站，不会替换本机收藏。</string>
     <string name="transfer_limit">合并后超过 2000 条上限，请选择替换或整理本机收藏。</string>
     <string name="transfer_confirm">确认导入</string>

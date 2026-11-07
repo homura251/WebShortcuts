@@ -6,6 +6,7 @@ import android.provider.DocumentsContract
 import io.github.homura251.webshortcuts.data.BookmarkCodec
 import io.github.homura251.webshortcuts.data.BookmarkItem
 import io.github.homura251.webshortcuts.data.BookmarkRepository
+import io.github.homura251.webshortcuts.data.LibrarySnapshot
 import io.github.homura251.webshortcuts.icons.IconPolicy
 import io.github.homura251.webshortcuts.icons.IconStore
 import io.github.homura251.webshortcuts.icons.StoredIconBytes
@@ -90,12 +91,14 @@ class TransferManager(
     }
 
     private suspend fun preview(prepared: PreparedImport): ImportPreview = mutationMutex.withLock {
-        val current = repository.snapshot()
-        val existing = current.map { if (prepared.format == TransferFormat.BACKUP_ZIP) it.id else it.url }.toSet()
-        val duplicateCount = prepared.parsed.items.count { (if (prepared.format == TransferFormat.BACKUP_ZIP) it.id else it.url) in existing }
-        ImportPreview(prepared.format, prepared.parsed.items.size, prepared.parsed.items.size - duplicateCount,
-            duplicateCount + prepared.parsed.duplicateCount, prepared.parsed.invalidCount, current.size,
-            prepared.parsed.appearance != null, prepared.parsed.exportedAt, prepared.parsed.warnings)
+        val current = repository.librarySnapshot()
+        val merged = TagImport.merge(current, prepared.parsed, prepared.format)
+        val duplicateCount = prepared.parsed.items.size - merged.incoming.size
+        ImportPreview(prepared.format, prepared.parsed.items.size, merged.incoming.size,
+            duplicateCount + prepared.parsed.duplicateCount, prepared.parsed.invalidCount, current.bookmarks.size,
+            prepared.parsed.appearance != null, prepared.parsed.exportedAt, prepared.parsed.warnings,
+            tagCount = prepared.parsed.tags.size, newTagCount = merged.addedTags,
+            tagUpdatedCount = merged.updatedBookmarks, localTagCount = current.tags.size, mergedTagCount = merged.library.tags.size)
     }
 
     /** Only the bounded local commit is noncancellable; disk state is all-old or all-new. */
@@ -108,18 +111,21 @@ class TransferManager(
         coroutineContext.ensureActive()
         return withContext(NonCancellable + Dispatchers.IO) {
             mutationMutex.withLock {
-                val before = repository.snapshot()
-                val existing = before.map { if (prepared.format == TransferFormat.BACKUP_ZIP) it.id else it.url }.toSet()
-                val incoming = prepared.parsed.items.filter { mode == ImportMode.REPLACE ||
-                    (if (prepared.format == TransferFormat.BACKUP_ZIP) it.id else it.url) !in existing }
-                val duplicates = prepared.parsed.duplicateCount + if (mode == ImportMode.MERGE) prepared.parsed.items.size - incoming.size else 0
+                val beforeLibrary = repository.librarySnapshot()
+                val before = beforeLibrary.bookmarks
+                val merged = TagImport.merge(beforeLibrary, prepared.parsed, prepared.format)
+                val incoming = if (mode == ImportMode.REPLACE) prepared.parsed.items else merged.incoming
+                val retained = if (mode == ImportMode.MERGE) merged.retained else emptyList()
+                val tags = if (mode == ImportMode.REPLACE) prepared.parsed.tags else merged.library.tags
+                val duplicates = prepared.parsed.duplicateCount + if (mode == ImportMode.MERGE)
+                    prepared.parsed.items.size - incoming.size - merged.updatedBookmarks else 0
                 val oldVersions = before.associate { it.id to it.imageVersion }
                 val versioned = incoming.map { item ->
                     val next = maxOf(item.imageVersion, oldVersions[item.id] ?: 0).toLong() + 1
                     require(next <= Int.MAX_VALUE) { "备份图标版本过大" }
                     item.copy(imageVersion = next.toInt())
                 }
-                val tentative = versioned + if (mode == ImportMode.MERGE) before else emptyList()
+                val tentative = LibrarySnapshot(versioned + retained, tags)
                 require(BookmarkCodec.encode(tentative).toByteArray(Charsets.UTF_8).size <= BookmarkCodec.MAX_JSON_BYTES) { "导入后收藏数据超过 4 MiB" }
                 var committed = false
                 val warnings = prepared.parsed.warnings.toMutableList()
@@ -135,10 +141,11 @@ class TransferManager(
                     val imported = versioned.map { item -> item.copy(autoImagePath = item.autoImagePath?.let(restored::getValue),
                         customImagePath = item.customImagePath?.let(restored::getValue),
                         customOriginalPath = item.customOriginalPath?.let(restored::getValue)) }
-                    val after = imported + if (mode == ImportMode.MERGE) before else emptyList()
+                    val after = imported + retained
+                    val afterLibrary = LibrarySnapshot(after, tags)
                     progress(TransferProgress("正在保存收藏…"))
                     // Existing duplicates do not get re-saved or a new version during merge.
-                    if (mode == ImportMode.REPLACE || imported.isNotEmpty()) repository.replaceAll(after)
+                    if (afterLibrary != beforeLibrary) repository.replaceAll(afterLibrary)
                     committed = true
                     if (restoreAppearance && prepared.parsed.appearance != null) {
                         try {
@@ -149,7 +156,9 @@ class TransferManager(
                     try {
                         if (!shortcuts.reconcileAfterImport(before, after)) warnings += "收藏已导入，部分桌面入口更新待重试"
                     } catch (_: Exception) { warnings += "收藏已导入，桌面入口更新待重试" }
-                    ImportResult(imported.size, duplicates, prepared.parsed.invalidCount, mode == ImportMode.REPLACE, warnings)
+                    ImportResult(imported.size, duplicates, prepared.parsed.invalidCount, mode == ImportMode.REPLACE, warnings,
+                        addedTags = if (mode == ImportMode.REPLACE) tags.size else merged.addedTags,
+                        tagUpdatedBookmarks = if (mode == ImportMode.MERGE) merged.updatedBookmarks else 0)
                 } finally {
                     // On failure only unreferenced new files are removed; committed old files remain.
                     try { icons.cleanup(repository.snapshot()) } catch (_: Exception) {
@@ -165,7 +174,8 @@ class TransferManager(
         val directory = session(token)
         val jobContext = coroutineContext
         mutationMutex.withLock {
-            val items = repository.snapshot()
+            val library = repository.librarySnapshot()
+            val items = library.bookmarks
             val appearance = preferences.state.value
             progress(TransferProgress("正在准备导出…"))
             val output = File(directory, "export.${format.extension}")
@@ -192,7 +202,7 @@ class TransferManager(
                     customImagePath = it.customImagePath?.takeIf(assets::containsKey),
                     customOriginalPath = it.customOriginalPath?.takeIf(assets::containsKey)) }
                 val appVersion = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
-                BackupArchive.write(output, cleaned, appearance, assets, appVersion, missing) { jobContext.ensureActive() }
+                BackupArchive.write(output, cleaned, appearance, assets, appVersion, missing, library.tags) { jobContext.ensureActive() }
             }
             val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
             val filename = "WebShortcuts-${if (format == TransferFormat.BACKUP_ZIP) "backup" else "bookmarks"}-$timestamp.${format.extension}"

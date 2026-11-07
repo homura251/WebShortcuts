@@ -50,7 +50,8 @@ internal object BookmarkHtmlCodec {
     }
 
     fun encode(items: List<BookmarkItem>): ByteArray {
-        BookmarkCodec.encode(items) // Apply the same field and collection limits as local storage.
+        // HTML intentionally carries no catalog or associations.
+        BookmarkCodec.encode(items.map { it.copy(tagIds = emptySet()) }) // Apply the same field and collection limits as local storage.
         val html = buildString {
             append("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n")
             append("<TITLE>WebShortcuts Bookmarks</TITLE>\n<H1>WebShortcuts</H1>\n<DL><p>\n")

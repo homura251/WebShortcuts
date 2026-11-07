@@ -116,6 +116,13 @@ internal fun TransferContent(state: TransferUiState, onDismiss: () -> Unit = {},
                     if (state.mode == ImportMode.MERGE) preview.newCount else preview.itemCount, preview.localCount))
                 if (state.mode == ImportMode.MERGE) SupportingText(stringResource(R.string.transfer_keep_local))
                 if (preview.format == TransferFormat.BOOKMARKS_HTML) SupportingText(stringResource(R.string.transfer_html_note))
+                if (preview.format == TransferFormat.BACKUP_ZIP && state.mode == ImportMode.MERGE) SupportingText(stringResource(R.string.transfer_tag_counts,
+                    preview.tagCount, preview.newTagCount, preview.tagUpdatedCount))
+                if (preview.format == TransferFormat.BACKUP_ZIP && state.mode == ImportMode.REPLACE)
+                    SupportingText(stringResource(R.string.transfer_tag_total, preview.tagCount))
+                if (state.mode == ImportMode.REPLACE) SupportingText(stringResource(
+                    if (preview.tagCount == 0 && preview.localTagCount > 0) R.string.transfer_no_tags_replace else R.string.transfer_tags_replace))
+                if (state.mode == ImportMode.MERGE && preview.mergedTagCount > 2000) SupportingText(stringResource(R.string.transfer_tag_limit))
                 if (preview.hasAppearance) {
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(value = state.restoreAppearance, role = Role.Checkbox,
                         onValueChange = onRestoreAppearance).testTag("restore_appearance"), verticalAlignment = Alignment.CenterVertically) {
@@ -163,7 +170,11 @@ internal fun TransferContent(state: TransferUiState, onDismiss: () -> Unit = {},
     }
     if (confirmReplace && state.phase == TransferPhase.PREVIEW) {
         AlertDialog(onDismissRequest = { confirmReplace = false }, title = { Text(stringResource(R.string.transfer_replace_title)) },
-            text = { Text(stringResource(R.string.transfer_replace_body, state.preview?.localCount ?: 0, state.preview?.itemCount ?: 0)) },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(stringResource(R.string.transfer_replace_body, state.preview?.localCount ?: 0, state.preview?.itemCount ?: 0))
+                Text(stringResource(if (state.preview?.tagCount == 0 && (state.preview?.localTagCount ?: 0) > 0)
+                    R.string.transfer_no_tags_replace else R.string.transfer_tags_replace))
+            } },
             confirmButton = {
                 TextButton(onClick = { confirmReplace = false; onCommit() }, modifier = Modifier.testTag("confirm_replace")) {
                     Text(stringResource(R.string.transfer_replace_confirm), color = MaterialTheme.colorScheme.error)

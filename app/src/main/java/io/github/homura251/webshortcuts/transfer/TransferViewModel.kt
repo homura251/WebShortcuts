@@ -129,6 +129,8 @@ class TransferViewModel(application: Application, private val saved: SavedStateH
             try {
                 val result = manager.commitImport(preparedToken, state.mode, state.restoreAppearance, ::progress)
                 val message = (if (result.replaced) "已恢复 ${result.imported} 条收藏" else "已新增 ${result.imported} 条收藏") +
+                    (if (result.addedTags > 0) "，新增 ${result.addedTags} 个标签" else "") +
+                    (if (result.tagUpdatedBookmarks > 0) "，为 ${result.tagUpdatedBookmarks} 条收藏补充标签" else "") +
                     "，跳过 ${result.skippedDuplicates} 条重复、${result.skippedInvalid} 条无效书签。"
                 runCatching { manager.discard(preparedToken) }
                 token = null

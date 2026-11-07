@@ -3,6 +3,8 @@ package io.github.homura251.webshortcuts.transfer
 import io.github.homura251.webshortcuts.data.BookmarkCodec
 import io.github.homura251.webshortcuts.data.BookmarkItem
 import io.github.homura251.webshortcuts.data.IconSourceMode
+import io.github.homura251.webshortcuts.data.LibrarySnapshot
+import io.github.homura251.webshortcuts.data.BookmarkTag
 import io.github.homura251.webshortcuts.icons.IconPolicy
 import io.github.homura251.webshortcuts.icons.IconProcessor
 import io.github.homura251.webshortcuts.ui.theme.AppearancePreferences
@@ -28,8 +30,8 @@ internal object BackupArchive {
     fun references(items: List<BookmarkItem>) = items.flatMap { listOfNotNull(it.autoImagePath, it.customImagePath, it.customOriginalPath) }.toSet()
 
     fun write(file: File, items: List<BookmarkItem>, appearance: AppearancePreferences, assets: Map<String, File>,
-              appVersion: String, missingImages: Int, checkpoint: () -> Unit = {}) {
-        val records = BookmarkCodec.encode(items).toByteArray(Charsets.UTF_8)
+              appVersion: String, missingImages: Int, tags: List<BookmarkTag> = emptyList(), checkpoint: () -> Unit = {}) {
+        val records = BookmarkCodec.encode(LibrarySnapshot(items, tags)).toByteArray(Charsets.UTF_8)
         require(records.size <= BookmarkCodec.MAX_JSON_BYTES)
         require(references(items) == assets.keys) { "备份图标引用不完整" }
         val manifest = JSONObject().put("format", "WebShortcutsBackup").put("formatVersion", 1)
@@ -94,7 +96,8 @@ internal object BackupArchive {
         require(manifest.getInt("formatVersion") == 1) { "不支持此备份版本，请更新应用" }
         val json = documents["bookmarks.json"]?.toString(Charsets.UTF_8) ?: error("备份缺少收藏数据")
         validateRawRecords(json)
-        val items = BookmarkCodec.decode(json)
+        val library = BookmarkCodec.decodeLibrary(json)
+        val items = library.bookmarks
         require(references(items) == assets.keys) { "备份图标缺失或包含未引用图片" }
         val warnings = mutableListOf<String>()
         var appearance: AppearancePreferences? = null
@@ -104,7 +107,7 @@ internal object BackupArchive {
         }
         val missing = manifest.optInt("missingImages", 0).coerceIn(0, 6000)
         if (missing > 0) warnings += "备份导出时有 $missing 份图像不可读取，相关收藏使用可用图片或字母回退"
-        return ParsedImport(items, appearance, exportedAt = manifest.optLong("exportedAt").takeIf { it > 0 }, warnings = warnings) to assets
+        return ParsedImport(items, appearance, exportedAt = manifest.optLong("exportedAt").takeIf { it > 0 }, warnings = warnings, tags = library.tags) to assets
     }
 
     private fun validateRawRecords(json: String) {

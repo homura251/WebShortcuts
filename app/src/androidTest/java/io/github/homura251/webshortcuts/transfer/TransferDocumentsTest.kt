@@ -22,8 +22,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import io.github.homura251.webshortcuts.MainActivity
 import io.github.homura251.webshortcuts.MainViewModel
 import io.github.homura251.webshortcuts.WebShortcutsApplication
-import java.io.File
-import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
@@ -37,21 +36,21 @@ class TransferDocumentsTest {
     @get:Rule val compose = createEmptyComposeRule()
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val application get() = instrumentation.targetContext.applicationContext as WebShortcutsApplication
-    private val fixtures get() = File(instrumentation.context.cacheDir, "transfer-test-fixtures")
+    private val resolver get() = application.contentResolver
     private var scenario: ActivityScenario<MainActivity>? = null
 
     @Before fun setUp() = runBlocking {
         application.filesDir.listFiles()?.forEach { it.deleteRecursively() }
         application.cacheDir.listFiles()?.forEach { it.deleteRecursively() }
         application.container.repository.load()
-        fixtures.mkdirs()
+        resolver.call(uri("input.html"), "reset", null, null)
         Intents.init()
     }
 
-    @After fun tearDown() { scenario?.close(); Intents.release(); fixtures.deleteRecursively() }
+    @After fun tearDown() { scenario?.close(); Intents.release(); resolver.call(uri("input.html"), "reset", null, null) }
 
     @Test fun importsAContentUriThenExportsBothFormatsThroughCreateDocument() {
-        File(fixtures, "input.html").writeText("<!DOCTYPE NETSCAPE-Bookmark-file-1><DL><DT><A HREF='https://example.test/?a=1&amp;b=2'>导入 &lt;标题&gt;</A></DL>")
+        resolver.call(uri("input.html"), "seed", null, null)
         intending(hasAction(Intent.ACTION_OPEN_DOCUMENT)).respondWith(ActivityResult(Activity.RESULT_OK,
             Intent().setData(uri("input.html")).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)))
         scenario = ActivityScenario.launch(MainActivity::class.java)
@@ -60,7 +59,7 @@ class TransferDocumentsTest {
         await("confirm_import")
         compose.onNodeWithTag("confirm_import").performClick()
         await("transfer_result")
-        compose.onNodeWithTag("transfer_result").assertTextContains("已新增 1 条收藏")
+        compose.onNodeWithTag("transfer_result").assertTextContains("已新增 1 条收藏", substring = true)
         assertEquals("导入 <标题>", application.container.repository.bookmarks.value.single().title)
         assertNull(application.container.repository.bookmarks.value.single().autoImagePath)
         compose.onNodeWithText("完成").performClick()
@@ -72,13 +71,18 @@ class TransferDocumentsTest {
             openTransfer()
             compose.onNodeWithTag("export_$format").performClick()
             await("transfer_result")
-            compose.onNodeWithTag("transfer_result").assertTextContains("已导出 1 条收藏")
-            val file = File(fixtures, "export.$format")
-            assertTrue(file.length() > 0)
-            if (format == "html") assertTrue(file.readText().contains("导入 &lt;标题&gt;"))
-            else ZipFile(file).use { zip ->
-                assertNotNull(zip.getEntry("manifest.json")); assertNotNull(zip.getEntry("appearance.json"))
-                assertTrue(zip.getInputStream(zip.getEntry("bookmarks.json")).reader().readText().contains("导入 <标题>"))
+            compose.onNodeWithTag("transfer_result").assertTextContains("已导出 1 条收藏", substring = true)
+            val bytes = resolver.openInputStream(uri("export.$format"))!!.use { it.readBytes() }
+            assertTrue(bytes.isNotEmpty())
+            if (format == "html") assertTrue(bytes.toString(Charsets.UTF_8).contains("导入 &lt;标题&gt;"))
+            else ZipInputStream(bytes.inputStream()).use { zip ->
+                val entries = mutableMapOf<String, String>()
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    entries[entry.name] = zip.readBytes().toString(Charsets.UTF_8)
+                }
+                assertNotNull(entries["manifest.json"]); assertNotNull(entries["appearance.json"])
+                assertTrue(entries.getValue("bookmarks.json").contains("导入 <标题>"))
             }
             compose.onNodeWithText("完成").performClick()
             compose.waitUntil(5000) { compose.onAllNodesWithTag("transfer_sheet").fetchSemanticsNodes().isEmpty() }

@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -22,34 +23,44 @@ class BookmarkRepository(context: Context) {
     private val metadata = AtomicFile(File(context.filesDir, "bookmarks.json"))
     private val mutex = Mutex()
     private var attemptedLoad = false
-    private val mutableBookmarks = MutableStateFlow<List<BookmarkItem>>(emptyList())
+    private val mutableLibrary = MutableStateFlow(LibrarySnapshot())
+    val library: StateFlow<LibrarySnapshot> = mutableLibrary.asStateFlow()
     private val mutableLoadError = MutableStateFlow<String?>(null)
-    val bookmarks: StateFlow<List<BookmarkItem>> = mutableBookmarks.asStateFlow()
+    // Compatibility projection; value reads and collection both use the same committed snapshot.
+    @OptIn(kotlinx.coroutines.InternalCoroutinesApi::class, kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi::class)
+    val bookmarks: StateFlow<List<BookmarkItem>> = object : StateFlow<List<BookmarkItem>> {
+        override val value get() = library.value.bookmarks
+        override val replayCache get() = listOf(value)
+        override suspend fun collect(collector: FlowCollector<List<BookmarkItem>>): Nothing =
+            library.collect { collector.emit(it.bookmarks) }
+    }
     val loadError: StateFlow<String?> = mutableLoadError.asStateFlow()
 
     suspend fun load() = withContext(Dispatchers.IO) {
         mutex.withLock { readFromDisk() }
     }
 
-    suspend fun save(item: BookmarkItem) = withContext(Dispatchers.IO) {
+    suspend fun save(item: BookmarkItem, changes: TagChanges? = null) = withContext(Dispatchers.IO) {
         mutex.withLock {
             ensureAvailable()
-            val normalized = item.copy(title = item.title.trim(), url = UrlNormalizer.normalize(item.url))
+            val (tags, added) = LibraryTags.resolve(mutableLibrary.value.tags, changes ?: TagChanges())
+            val normalized = item.copy(title = item.title.trim(), url = UrlNormalizer.normalize(item.url),
+                tagIds = if (changes == null) item.tagIds else (item.tagIds - changes.removeIds) + added)
             BookmarkCodec.validate(normalized)
-            val old = mutableBookmarks.value
+            val old = mutableLibrary.value.bookmarks
             val index = old.indexOfFirst { it.id == normalized.id }
             val updated = old.toMutableList().apply {
                 if (index < 0) add(0, normalized) else set(index, normalized)
             }
-            writeToDisk(updated)
+            writeToDisk(LibrarySnapshot(updated, tags))
         }
     }
 
     suspend fun delete(id: String): BookmarkItem? = withContext(Dispatchers.IO) {
         mutex.withLock {
             ensureAvailable()
-            val deleted = mutableBookmarks.value.firstOrNull { it.id == id } ?: return@withLock null
-            writeToDisk(mutableBookmarks.value.filterNot { it.id == id })
+            val deleted = mutableLibrary.value.bookmarks.firstOrNull { it.id == id } ?: return@withLock null
+            writeToDisk(mutableLibrary.value.copy(bookmarks = mutableLibrary.value.bookmarks.filterNot { it.id == id }))
             deleted
         }
     }
@@ -57,12 +68,12 @@ class BookmarkRepository(context: Context) {
     suspend fun find(id: String): BookmarkItem? = withContext(Dispatchers.IO) {
         mutex.withLock {
             ensureAvailable()
-            mutableBookmarks.value.firstOrNull { it.id == id }
+            mutableLibrary.value.bookmarks.firstOrNull { it.id == id }
         }
     }
 
     suspend fun snapshot(): List<BookmarkItem> = withContext(Dispatchers.IO) {
-        mutex.withLock { ensureAvailable(); mutableBookmarks.value.toList() }
+        mutex.withLock { ensureAvailable(); mutableLibrary.value.bookmarks.toList() }
     }
 
     /** Caller holds the app mutation mutex while staging images and committing the collection. */
@@ -70,7 +81,76 @@ class BookmarkRepository(context: Context) {
         mutex.withLock {
             ensureAvailable()
             val normalized = items.map { it.copy(title = it.title.trim(), url = UrlNormalizer.normalize(it.url)) }
-            writeToDisk(normalized)
+            writeToDisk(mutableLibrary.value.copy(bookmarks = normalized))
+        }
+    }
+
+    suspend fun librarySnapshot(): LibrarySnapshot = withContext(Dispatchers.IO) {
+        mutex.withLock { ensureAvailable(); mutableLibrary.value }
+    }
+
+    suspend fun replaceAll(snapshot: LibrarySnapshot) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            ensureAvailable()
+            writeToDisk(snapshot.copy(bookmarks = snapshot.bookmarks.map {
+                it.copy(title = it.title.trim(), url = UrlNormalizer.normalize(it.url))
+            }))
+        }
+    }
+
+    suspend fun createTag(rawName: String): BookmarkTag = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            ensureAvailable()
+            val name = LibraryTags.name(rawName)
+            require(mutableLibrary.value.tags.none { LibraryTags.key(it.name) == LibraryTags.key(name) }) { "标签名称已存在" }
+            require(mutableLibrary.value.tags.size < LibraryTags.MAX_TAGS) { "标签数量已达到上限" }
+            val tag = BookmarkTag(name = name)
+            writeToDisk(mutableLibrary.value.copy(tags = mutableLibrary.value.tags + tag))
+            tag
+        }
+    }
+
+    suspend fun renameTag(id: String, rawName: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            ensureAvailable()
+            val old = mutableLibrary.value
+            check(old.tags.any { it.id == id }) { "标签已被删除" }
+            val name = LibraryTags.name(rawName)
+            require(old.tags.none { it.id != id && LibraryTags.key(it.name) == LibraryTags.key(name) }) { "标签名称已存在" }
+            val updated = old.copy(tags = old.tags.map { if (it.id == id) it.copy(name = name) else it })
+            if (updated != old) writeToDisk(updated)
+        }
+    }
+
+    suspend fun deleteTag(id: String) = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            ensureAvailable()
+            val old = mutableLibrary.value
+            val updated = old.copy(tags = old.tags.filterNot { it.id == id }, bookmarks = old.bookmarks.map {
+                if (id in it.tagIds) it.copy(tagIds = it.tagIds - id, updatedAt = System.currentTimeMillis()) else it
+            })
+            if (updated != old) writeToDisk(updated)
+        }
+    }
+
+    /** Deltas apply to current records, preserving all unrelated fields and labels. */
+    suspend fun applyTags(ids: Set<String>, changes: TagChanges): Int = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            ensureAvailable()
+            val old = mutableLibrary.value
+            check(ids.isNotEmpty() && old.bookmarks.any { it.id in ids }) { "所选收藏已被删除" }
+            val (tags, added) = LibraryTags.resolve(old.tags, changes)
+            var changed = 0
+            val items = old.bookmarks.map { item ->
+                val next = if (item.id in ids) (item.tagIds - changes.removeIds) + added else item.tagIds
+                if (next == item.tagIds) item else {
+                    changed++
+                    item.copy(tagIds = next, updatedAt = System.currentTimeMillis())
+                }
+            }
+            val updated = LibrarySnapshot(items, tags)
+            if (updated != old) writeToDisk(updated)
+            changed
         }
     }
 
@@ -85,7 +165,7 @@ class BookmarkRepository(context: Context) {
             // AtomicFile.openRead also restores an interrupted write's backup when applicable.
             val input = try { metadata.openRead() } catch (missing: java.io.FileNotFoundException) {
                 if (metadata.baseFile.exists() || File(metadata.baseFile.path + ".bak").exists()) throw missing
-                mutableBookmarks.value = emptyList()
+                mutableLibrary.value = LibrarySnapshot()
                 mutableLoadError.value = null
                 return
             }
@@ -102,15 +182,16 @@ class BookmarkRepository(context: Context) {
                 }
                 output.toString(Charsets.UTF_8.name())
             }
-            mutableBookmarks.value = BookmarkCodec.decode(json)
+            mutableLibrary.value = BookmarkCodec.decodeLibrary(json)
             mutableLoadError.value = null
         } catch (failure: Exception) {
             mutableLoadError.value = "无法读取本地收藏，原文件已保留。${failure.message.orEmpty().take(160)}"
         }
     }
 
-    private fun writeToDisk(items: List<BookmarkItem>) {
-        val bytes = BookmarkCodec.encode(items).toByteArray(Charsets.UTF_8)
+    private fun writeToDisk(snapshot: LibrarySnapshot) {
+        val committed = snapshot.copy(bookmarks = snapshot.bookmarks.map { it.copy(tagIds = it.tagIds.toSet()) }, tags = snapshot.tags.toList())
+        val bytes = BookmarkCodec.encode(committed).toByteArray(Charsets.UTF_8)
         require(bytes.size <= BookmarkCodec.MAX_JSON_BYTES) { "收藏文件超过安全存储上限" }
         val stream = metadata.startWrite()
         try {
@@ -120,7 +201,7 @@ class BookmarkRepository(context: Context) {
             metadata.failWrite(stream)
             throw failure
         }
-        mutableBookmarks.value = items.toList()
+        mutableLibrary.value = committed
         mutableLoadError.value = null
     }
 }
